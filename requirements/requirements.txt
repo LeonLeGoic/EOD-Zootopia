@@ -1,0 +1,17 @@
+# requirements.txt - Dépendances Python (pour Jupyter)
+# Installe avec : pip install -r requirements/requirements.txt
+
+# Jupyter et notebook
+jupyter>=1.0.0
+jupyterlab>=4.0.0
+
+# Manipulation données
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Visualisation
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Utilités
+openpyxl>=3.10.0

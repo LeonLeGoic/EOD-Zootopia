@@ -1,0 +1,33 @@
+# Résultats générés
+results/*.csv
+results/*.png
+results/*.json
+
+# Julia
+*.jl.swp
+*.jl.swo
+*~
+.DS_Store
+Manifest.toml
+.julia/
+
+# Python / Jupyter
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+*.ipynb_bak
+.jupyter/
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+*.log
