@@ -447,6 +447,16 @@ function create_eod_model(
     model = Model(HiGHS.Optimizer)
     set_optimizer_attribute(model, "log_to_console", false)
     set_optimizer_attribute(model, "time_limit", 300.0)
+
+    # Pré-calculer les minima/maxima de stock pour chaque heure de la fenêtre
+    stock_limits = []
+    for t in 1:tmax
+        date_index = (window_start + t - 2) % length(stocks_hydro) + 1
+        stock_data = stocks_hydro[date_index]
+        stock_min = max(0.0, (stock_data.lev_low / 100) * HYDRO_CAPACITY_MWh)
+        stock_max = min(HYDRO_CAPACITY_MWh, (stock_data.lev_high / 100) * HYDRO_CAPACITY_MWh)
+        push!(stock_limits, (stock_min, stock_max))
+    end
     
     # ====== VARIABLES ======
     # Production par type
@@ -574,15 +584,11 @@ function create_eod_model(
     
     # ====== CONTRAINTES HYDRAULIQUE FDL ======
     @constraint(model, [t=1:tmax], Phy_fdl[t] == min(inflows_fdl[t], HYDRO_FDL_CAPACITY_MW))
-    
+
     # ====== CONTRAINTES HYDRAULIQUE LACS ======
-    # Minima/maxima historiques avec slack
+    # Utilise minima/maxima pré-calculés
     for t in 1:tmax
-        date_index = (window_start + t - 2) % length(stocks_hydro) + 1
-        stock_data = stocks_hydro[date_index]
-        stock_min = max(0, (stock_data.lev_low / 100) * HYDRO_CAPACITY_MWh)
-        stock_max = min(HYDRO_CAPACITY_MWh, (stock_data.lev_high / 100) * HYDRO_CAPACITY_MWh)
-        
+        stock_min, stock_max = stock_limits[t]
         @constraint(model, stock_hydro[t] >= stock_min - slack_stock_min[t])
         @constraint(model, stock_hydro[t] <= stock_max + slack_stock_max[t])
     end
@@ -597,18 +603,27 @@ function create_eod_model(
         @constraint(model, Phy_lac[t] <= limite_hydro)
     end
     
-    # ====== CONTRAINTES STOCK SAISONNIER (AVEC SLACK) ======
-    for season in ["fin_mars", "fin_mai", "fin_septembre", "fin_novembre"]
-        target_pct = get_seasonal_stock_target(scenario, season)
-        target_mwh = target_pct * HYDRO_CAPACITY_MWh
+    # ====== CONTRAINTES STOCK SAISONNIER ======
+    for t in 1:tmax
+        hour_global = window_start + t - 1
         
-        for t in 1:tmax
-            hour_global = window_start + t - 1
-            
-            if is_in_seasonal_window(hour_global, season)
-                # Contrainte avec slack : permet de dépasser si nécessaire mais coûteux
-                @constraint(model, stock_hydro[t] + slack_seasonal[t] >= target_mwh)
-            end
+        # Cherche si heure est dans une fenêtre saisonnière
+        if hour_global >= 2041 && hour_global <= 2280  # fin_mars
+            target_pct = get_seasonal_stock_target(scenario, "fin_mars")
+            target_mwh = target_pct * HYDRO_CAPACITY_MWh
+            @constraint(model, stock_hydro[t] + slack_seasonal[t] >= target_mwh)
+        elseif hour_global >= 3505 && hour_global <= 3744  # fin_mai
+            target_pct = get_seasonal_stock_target(scenario, "fin_mai")
+            target_mwh = target_pct * HYDRO_CAPACITY_MWh
+            @constraint(model, stock_hydro[t] + slack_seasonal[t] >= target_mwh)
+        elseif hour_global >= 6433 && hour_global <= 6672  # fin_septembre
+            target_pct = get_seasonal_stock_target(scenario, "fin_septembre")
+            target_mwh = target_pct * HYDRO_CAPACITY_MWh
+            @constraint(model, stock_hydro[t] + slack_seasonal[t] >= target_mwh)
+        elseif hour_global >= 7921 && hour_global <= 8160  # fin_novembre
+            target_pct = get_seasonal_stock_target(scenario, "fin_novembre")
+            target_mwh = target_pct * HYDRO_CAPACITY_MWh
+            @constraint(model, stock_hydro[t] + slack_seasonal[t] >= target_mwh)
         end
     end
     
