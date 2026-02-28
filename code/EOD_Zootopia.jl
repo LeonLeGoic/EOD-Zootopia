@@ -50,7 +50,9 @@ struct ConsommationHoraire
     fil_de_leau::Int
     lacs::Int
     step::Int
-    hydro_total::Int
+    conso_charge::Int
+    eolien_cons::Int
+    solaire_cons::Int
 end
 
 # ==============================================================================
@@ -149,12 +151,15 @@ function load_excel_data(data_file::String)
     fil_de_leau_cons = XLSX.readdata(data_file, sheet_details, "M2:M8761")
     lacs_cons = XLSX.readdata(data_file, sheet_details, "N2:N8761")
     step_cons = XLSX.readdata(data_file, sheet_details, "O2:O8761")
+    conso_charge = XLSX.readdata(data_file, sheet_details, "Q2:Q8761")
+    eolien_cons = XLSX.readdata(data_file, sheet_details, "R2:R8761")
+    solaire_cons = XLSX.readdata(data_file, sheet_details, "S2:S8761")
     
     consommations_horaires = ConsommationHoraire[]
     for i in eachindex(dates_cons)
         push!(consommations_horaires, ConsommationHoraire(
             string(dates_cons[i]), string(heures_cons[i]),
-            fil_de_leau_cons[i], lacs_cons[i], step_cons[i], 0
+            fil_de_leau_cons[i], lacs_cons[i], step_cons[i], conso_charge[i], eolien_cons[i], solaire_cons[i]
         ))
     end
     
@@ -290,96 +295,19 @@ end
 # SECTION 6 : GÉNÉRATION DES DONNÉES
 # ==============================================================================
 
-function generate_synthetic_load(year_hours::Int; annual_energy_twh::Float64=CONSO_ANNUELLE_TWH)::Vector{Float64}
-    """Générer une courbe de consommation synthétique"""
-    Random.seed!(42)
+function generate_complete_year_data(scenario::String)::NTuple{8, Vector{Float64}}
     
-    annual_energy_mwh = annual_energy_twh * 1_000_000
-    mean_load = annual_energy_mwh / year_hours
-    h = collect(1:year_hours)
-    
-    # Effet saisonnier
-    seasonal = 1 .+ 0.15 .* cos.(2π .* (h .- 1) ./ year_hours)
-    
-    # Effet journalier
-    hour_of_day = ((h .- 1) .% 24) .+ 1
-    daily = 1 .+ 0.10 .* exp.(-((hour_of_day .- 9) ./ 3).^2) .+ 
-                0.15 .* exp.(-((hour_of_day .- 19) ./ 3).^2)
-    
-    # Bruit aléatoire
-    noise = 1 .+ 0.03 .* randn(year_hours)
-    
-    load = mean_load .* seasonal .* daily .* noise
-    load = max.(load, 0.0)
-    
-    # Normaliser à la consommation cible
-    load .*= annual_energy_mwh / sum(load)
-    
-    return load
-end
-
-function generate_complete_year_data(scenario::String, load::Vector{Float64})::NTuple{8, Vector{Float64}}
-    """Générer les données complètes pour une année et un scénario"""
-    Random.seed!(42)
-    
-    year_hours = length(load)
-    h = collect(1:year_hours)
-    
-    # ====== ÉOLIEN ======
-    wind_capacity = 6400.0
-    wind_bias = METEO_SCENARIOS[scenario].wind_bias
-
-    # Réduire la variation saisonnière
-    season_wind = 0.15 .+ 0.05 .* cos.(2π .* (h .- 2000) ./ 8760)
-
-    # Processus AR(1) pour la persistance
-    wind_noise = zeros(year_hours)
-    wind_noise[1] = randn()
-    for t in 2:year_hours
-        wind_noise[t] = 0.85 * wind_noise[t-1] + 0.5 * randn()
-    end
-    wind_noise = (wind_noise .- mean(wind_noise)) ./ std(wind_noise)
-
-    # Réduire la base et l'amplitude du bruit
-    wind_cf = clamp.(0.2 .+ 0.5 .* season_wind .+ wind_bias .+ 0.05 .* wind_noise, 0.0, 0.95)
-
-    # Production finale
-    wind = wind_capacity .* wind_cf
-    
-    # ====== SOLAIRE ======
-    solar_capacity = 3000.0
-    day_of_year = ((h .- 1) .÷ 24) .+ 1
-    hour_of_day = ((h .- 1) .% 24) .+ 1
-    solar_bias = METEO_SCENARIOS[scenario].solar_bias
-    
-    day_length = 12 .+ 4 .* sin.(2π .* (day_of_year .- 80) ./ 365)
-    sunrise = 12 .- day_length ./ 2
-    sunset = 12 .+ day_length ./ 2
-    
-    solar_shape = ifelse.(hour_of_day .< sunrise .|| hour_of_day .> sunset,
-                          0.0, sin.(π .* (hour_of_day .- sunrise) ./ day_length))
-    
-    daily_cloud = clamp.(0.65 .+ solar_bias .+ 0.25 .* randn(365), 0.15, 1.0)
-    cloud_factor = daily_cloud[day_of_year]
-    
-    solar = solar_capacity .* solar_shape .* cloud_factor
-    
-    # Affichage des facteurs de charge
-    wind_cf_annual = mean(wind) / wind_capacity
-    solar_cf_annual = mean(solar) / solar_capacity
-    println("─────────────────────────────────────")
-    println("SCÉNARIO MÉTÉO : $scenario")
-    println("Facteur de charge éolien  : $(round(wind_cf_annual*100, digits=1))%")
-    println("Facteur de charge solaire : $(round(solar_cf_annual*100, digits=1))%")
-    println("─────────────────────────────────────")
-    
-    # ====== HYDRAULIQUE ======
+    # ====== HYDRAULIQUE, CONSO ET ENR ======
     inflows_fdl = Float64[cons.fil_de_leau for cons in consommations_horaires[1:YEAR_HOURS]]
-    # inflows_lac = Float64[cons.lacs for cons in consommations_horaires[1:YEAR_HOURS]]
+    load = Float64[cons.conso_charge for cons in consommations_horaires[1:YEAR_HOURS]]
+    wind = Float64[cons.eolien_cons for cons in consommations_horaires[1:YEAR_HOURS]]
+    solar = Float64[cons.solaire_cons for cons in consommations_horaires[1:YEAR_HOURS]]
     inflows_fdl = recale_hydro_values(inflows_fdl, HYDRO_SHIFT_HOURS)
-    # inflows_lac = recale_hydro_values(inflows_lac, HYDRO_SHIFT_HOURS)
+    load = recale_hydro_values(load, HYDRO_SHIFT_HOURS)
+    wind = recale_hydro_values(wind, HYDRO_SHIFT_HOURS)
+    solar = recale_hydro_values(solar, HYDRO_SHIFT_HOURS)
     
-    # Apports mensuels distribués
+    # ====== Apports mensuels distribués ======
     apports_mensuels_gwh = [
         (1, 228.687), (2, 402.087), (3, 463.140), (4, 472.486),
         (5, 556.264), (6, 471.685), (7, 452.414), (8, 344.348),
@@ -410,7 +338,7 @@ function generate_complete_year_data(scenario::String, load::Vector{Float64})::N
         end
     end
     
-    inflows_lac = inflows_lac_opt[1:year_hours]
+    inflows_lac = inflows_lac_opt[1:YEAR_HOURS]
     
     # Appliquer les facteurs scénario
     if scenario == "dry"
@@ -422,8 +350,8 @@ function generate_complete_year_data(scenario::String, load::Vector{Float64})::N
     end
     
     # ====== BIOÉNERGIES ======
-    dechets = fill(60.0, year_hours)
-    biomasse = fill(365.0 * BIOMASSE_FACTOR, year_hours)
+    dechets = fill(60.0, YEAR_HOURS)
+    biomasse = fill(365.0 * BIOMASSE_FACTOR, YEAR_HOURS)
     fatale = dechets .+ biomasse
     
     return load, wind, solar, inflows_fdl, inflows_lac, dechets, biomasse, fatale
@@ -442,7 +370,7 @@ function create_eod_model(
     tmax::Int, window_start::Int,
     unites::Vector{UniteCentrale},
     stocks_hydro::Vector{StockHydro}
-)::Model
+)::Tuple{Model, Vector}
     
     model = Model(HiGHS.Optimizer)
     set_optimizer_attribute(model, "log_to_console", false)
@@ -562,6 +490,81 @@ function create_eod_model(
         unit = unites[u]
         @constraint(model, [t=1:tmax], P_fioul[t, u] <= unit.Pmax * UC_fioul[t, u])
         @constraint(model, [t=1:tmax], P_fioul[t, u] >= unit.Pmin * UC_fioul[t, u])
+    end
+    
+    # ====== CONTRAINTES DURÉE MINIMALE DE FONCTIONNEMENT (DMIN) ======
+
+    # NUCLÉAIRE
+    for u in nuclear_units
+        unit = unites[u]
+        if unit.dmin > 0
+            for t in 1:tmax
+                if t + unit.dmin - 1 <= tmax
+                    # Si allumée à t, doit rester allumée au moins dmin heures
+                    @constraint(model, sum(UC_nuc[tau, u] for tau in t:min(t+unit.dmin-1, tmax)) >= unit.dmin * (UC_nuc[t, u] - (t > 1 ? UC_nuc[t-1, u] : 0)))
+                end
+            end
+        end
+    end
+
+    # CHARBON
+    for u in charbon_units
+        unit = unites[u]
+        if unit.dmin > 0
+            for t in 1:tmax
+                if t + unit.dmin - 1 <= tmax
+                    @constraint(model, sum(UC_charbon[tau, u] for tau in t:min(t+unit.dmin-1, tmax)) >= unit.dmin * (UC_charbon[t, u] - (t > 1 ? UC_charbon[t-1, u] : 0)))
+                end
+            end
+        end
+    end
+
+    # CCG
+    for u in ccg_units
+        unit = unites[u]
+        if unit.dmin > 0
+            for t in 1:tmax
+                if t + unit.dmin - 1 <= tmax
+                    @constraint(model, sum(UC_ccg[tau, u] for tau in t:min(t+unit.dmin-1, tmax)) >= unit.dmin * (UC_ccg[t, u] - (t > 1 ? UC_ccg[t-1, u] : 0)))
+                end
+            end
+        end
+    end
+
+    # TAC
+    for u in tac_units
+        unit = unites[u]
+        if unit.dmin > 0
+            for t in 1:tmax
+                if t + unit.dmin - 1 <= tmax
+                    @constraint(model, sum(UC_tac[tau, u] for tau in t:min(t+unit.dmin-1, tmax)) >= unit.dmin * (UC_tac[t, u] - (t > 1 ? UC_tac[t-1, u] : 0)))
+                end
+            end
+        end
+    end
+
+    # COGÉNÉRATION
+    for u in cogen_units
+        unit = unites[u]
+        if unit.dmin > 0
+            for t in 1:tmax
+                if t + unit.dmin - 1 <= tmax
+                    @constraint(model, sum(UC_cogen[tau, u] for tau in t:min(t+unit.dmin-1, tmax)) >= unit.dmin * (UC_cogen[t, u] - (t > 1 ? UC_cogen[t-1, u] : 0)))
+                end
+            end
+        end
+    end
+
+    # FIOUL
+    for u in fioul_units
+        unit = unites[u]
+        if unit.dmin > 0
+            for t in 1:tmax
+                if t + unit.dmin - 1 <= tmax
+                    @constraint(model, sum(UC_fioul[tau, u] for tau in t:min(t+unit.dmin-1, tmax)) >= unit.dmin * (UC_fioul[t, u] - (t > 1 ? UC_fioul[t-1, u] : 0)))
+                end
+            end
+        end
     end
     
     # ====== CONTRAINTES ENR (MUST-TAKE) ======
@@ -704,7 +707,7 @@ function create_eod_model(
         cost_thermal + cost_hydro + cost_pump + cost_spill + cost_unserved + cost_slack
     )
     
-    return model
+    return model, stock_limits
 end
 
 # ==============================================================================
@@ -777,7 +780,7 @@ function solve_year_rolling(
         hours_in_window = length(window_range)
         
         # Créer et résoudre modèle
-        model = create_eod_model(
+        model, stock_limits = create_eod_model(
             window_num, month, scenario,
             load_w, wind_w, solar_w, fdl_w, lac_w, fat_w, dec_w, bio_w,
             stock_hydro_current, stock_step_current, hours_in_window, window_start,
@@ -849,7 +852,9 @@ function solve_year_rolling(
                     "UC_cogen" => sum(UC_cogen[t, :]),
                     "UC_fioul" => sum(UC_fioul[t, :]),
                     "Pcharge_STEP" => Pcharge_STEP[t],
-                    "Pdecharge_STEP" => Pdecharge_STEP[t]
+                    "Pdecharge_STEP" => Pdecharge_STEP[t],
+                    "stock_hydro_min" => stock_limits[t][1],
+                    "stock_hydro_max" => stock_limits[t][2]
                 ))
             end
             
@@ -878,11 +883,8 @@ println("="^80 * "\n")
 
 # Initialiser
 unites = initialize_unites()
-stocks_hydro, apports_mensuels, consommations_horaires = load_excel_data("Donnees_etude_de_cas_ETE305.xlsx")
+stocks_hydro, apports_mensuels, consommations_horaires = load_excel_data(".//data//Donnees_etude_de_cas_ETE305.xlsx")
 stocks_hydro = recale_hydro_stocks(stocks_hydro, HYDRO_SHIFT_DAYS)
-
-# Générer charge unique pour tous les scénarios
-global_load = generate_synthetic_load(YEAR_HOURS)
 
 # Paramètres scénarios
 scenario_params = Dict(
@@ -899,11 +901,11 @@ for scenario in ["dry", "normal", "wet"]
     println("SCÉNARIO : $scenario")
     println("-"^80)
     
-    _, wind, solar, fdl, lac, dechets, biomasse, fatale = 
-        generate_complete_year_data(scenario, global_load)
+    load, wind, solar, fdl, lac, dechets, biomasse, fatale = 
+        generate_complete_year_data(scenario)
     
     results = solve_year_rolling(
-        global_load, wind, solar, fdl, lac, dechets, biomasse, fatale,
+        load, wind, solar, fdl, lac, dechets, biomasse, fatale,
         scenario, scenario_params[scenario],
         unites, stocks_hydro
     )
@@ -951,7 +953,9 @@ for scenario in keys(results_all)
         UC_cogen = [r["UC_cogen"] for r in results_all[scenario]],
         UC_fioul = [r["UC_fioul"] for r in results_all[scenario]],
         Pdecharge_STEP = [r["Pdecharge_STEP"] for r in results_all[scenario]],
-        Pcharge_STEP = [r["Pcharge_STEP"] for r in results_all[scenario]]
+        Pcharge_STEP = [r["Pcharge_STEP"] for r in results_all[scenario]],
+        stock_hydro_min = [r["stock_hydro_min"] for r in results_all[scenario]],
+        stock_hydro_max = [r["stock_hydro_max"] for r in results_all[scenario]]
     )
     
     filepath = "./results/results_$scenario.csv"
