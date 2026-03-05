@@ -568,7 +568,8 @@ function create_eod_model(
     stock_hydro_init::Float64, stock_step_init::Float64,
     tmax::Int, window_start::Int,
     unites::Vector{UniteCentrale},
-    stocks_hydro::Vector{StockHydro}
+    stocks_hydro::Vector{StockHydro},
+    uc_init::Dict{String, Vector{Float64}}      # ← AJOUT
 )::Tuple{Model, Vector, Vector, Vector, Vector}
 
     model = Model(HiGHS.Optimizer)
@@ -586,30 +587,6 @@ function create_eod_model(
         stock_max  = min(HYDRO_CAPACITY_MWh, (stock_data.lev_high / 100) * HYDRO_CAPACITY_MWh)
         push!(stock_limits, (stock_min, stock_max))
     end
-
-    # ====== VARIABLES ======
-
-    # # ====== VARIABLES UP/DO POUR DMIN ======
-    # # Indexation locale (1:n) pour compatibilité JuMP
-    # n_nuc    = length(nuclear_units)
-    # n_char   = length(charbon_units)
-    # n_ccg    = length(ccg_units)
-    # n_tac    = length(tac_units)
-    # n_cogen  = length(cogen_units)
-    # n_fioul  = length(fioul_units)
-
-    # @variable(model, UP_nuc[1:tmax,   1:n_nuc],   Bin)
-    # @variable(model, DO_nuc[1:tmax,   1:n_nuc],   Bin)
-    # @variable(model, UP_charbon[1:tmax, 1:n_char], Bin)
-    # @variable(model, DO_charbon[1:tmax, 1:n_char], Bin)
-    # @variable(model, UP_ccg[1:tmax,   1:n_ccg],   Bin)
-    # @variable(model, DO_ccg[1:tmax,   1:n_ccg],   Bin)
-    # @variable(model, UP_tac[1:tmax,   1:n_tac],   Bin)
-    # @variable(model, DO_tac[1:tmax,   1:n_tac],   Bin)
-    # @variable(model, UP_cogen[1:tmax, 1:n_cogen], Bin)
-    # @variable(model, DO_cogen[1:tmax, 1:n_cogen], Bin)
-    # @variable(model, UP_fioul[1:tmax, 1:n_fioul], Bin)
-    # @variable(model, DO_fioul[1:tmax, 1:n_fioul], Bin)
 
     nuclear_units = [u for (u, unit) in enumerate(unites) if occursin("Nucléaire", unit.type)]
     @variable(model, P_nuc[1:tmax, nuclear_units] >= 0)
@@ -672,6 +649,53 @@ function create_eod_model(
     @variable(model, S_socle[1:tmax] >= 0)
     @variable(model, S_surplus[1:tmax] >= 0)
 
+    # ====== VARIABLES UP/DO POUR DMIN ======
+    n_nuc   = length(nuclear_units)
+    n_char  = length(charbon_units)
+    n_ccg   = length(ccg_units)
+    n_tac   = length(tac_units)
+    n_fioul = length(fioul_units)
+
+    @variable(model, UP_nuc[1:tmax,    1:n_nuc],   Bin)
+    @variable(model, DO_nuc[1:tmax,    1:n_nuc],   Bin)
+    @variable(model, UP_charbon[1:tmax, 1:n_char],  Bin)
+    @variable(model, DO_charbon[1:tmax, 1:n_char],  Bin)
+    @variable(model, UP_ccg[1:tmax,    1:n_ccg],   Bin)
+    @variable(model, DO_ccg[1:tmax,    1:n_ccg],   Bin)
+    @variable(model, UP_tac[1:tmax,    1:n_tac],   Bin)
+    @variable(model, DO_tac[1:tmax,    1:n_tac],   Bin)
+    @variable(model, UP_fioul[1:tmax,  1:n_fioul], Bin)
+    @variable(model, DO_fioul[1:tmax,  1:n_fioul], Bin)
+
+    # ====== CONTRAINTES DURÉE MINIMALE avec UP/DO ======
+    function add_dmin!(model, UC, UP, DO, global_indices, unites, tmax, uc_init_vec)
+        for (i_local, u_global) in enumerate(global_indices)
+            dmin = unites[u_global].dmin
+            for t in 1:tmax
+                uc_curr = UC[t, u_global]
+                uc_prev = t == 1 ? uc_init_vec[i_local] : UC[t-1, u_global]
+                up_t    = UP[t, i_local]
+                do_t    = DO[t, i_local]
+                @constraint(model, up_t - do_t == uc_curr - uc_prev)
+                @constraint(model, up_t + do_t <= 1)
+            end
+            if dmin > 0
+                for t in 1:tmax
+                    tend = min(t + dmin - 1, tmax)
+                    @constraint(model,
+                        sum(UC[tau, u_global] for tau in t:tend) >= dmin * UP[t, i_local]
+                    )
+                end
+            end
+        end
+    end
+
+    add_dmin!(model, UC_nuc,     UP_nuc,     DO_nuc,     nuclear_units, unites, tmax, uc_init["nuc"])
+    add_dmin!(model, UC_charbon, UP_charbon, DO_charbon, charbon_units, unites, tmax, uc_init["charbon"])
+    add_dmin!(model, UC_ccg,     UP_ccg,     DO_ccg,     ccg_units,     unites, tmax, uc_init["ccg"])
+    add_dmin!(model, UC_tac,     UP_tac,     DO_tac,     tac_units,     unites, tmax, uc_init["tac"])
+    add_dmin!(model, UC_fioul,   UP_fioul,   DO_fioul,   fioul_units,   unites, tmax, uc_init["fioul"])
+
     # ====== CONTRAINTES THERMIQUES ======
     for u in nuclear_units
         unit = unites[u]
@@ -712,45 +736,6 @@ function create_eod_model(
         @constraint(model, [t=1:tmax], P_fioul[t, u] <= unit.Pmax * UC_fioul[t, u])
         @constraint(model, [t=1:tmax], P_fioul[t, u] >= unit.Pmin * UC_fioul[t, u])
     end
-
-    # # ====== CONTRAINTES DURÉE MINIMALE (DMIN) avec UP/DO ======
-
-    # function add_dmin!(model, UC, UP, DO, global_indices, unites, tmax)
-    #     # UC est indexé par global_indices (ex: nuclear_units)
-    #     # UP/DO sont indexés par 1:n (indices locaux)
-    #     for (i_local, u_global) in enumerate(global_indices)
-    #         dmin = unites[u_global].dmin
-
-    #         for t in 1:tmax
-    #             uc_curr = UC[t, u_global]
-    #             uc_prev = t == 1 ? 0 : UC[t-1, u_global]
-    #             up_t    = UP[t, i_local]
-    #             do_t    = DO[t, i_local]
-
-    #             # UC[t] - UC[t-1] = UP[t] - DO[t]
-    #             @constraint(model, up_t - do_t == uc_curr - uc_prev)
-    #             # Ne peut pas démarrer ET s'arrêter au même instant
-    #             @constraint(model, up_t + do_t <= 1)
-    #         end
-
-    #         # Si démarre en t (UP=1), reste allumé au moins dmin heures
-    #         if dmin > 0
-    #             for t in 1:tmax
-    #                 tend = min(t + dmin - 1, tmax)
-    #                 @constraint(model,
-    #                     sum(UC[tau, u_global] for tau in t:tend) >= dmin * UP[t, i_local]
-    #                 )
-    #             end
-    #         end
-    #     end
-    # end
-
-    # add_dmin!(model, UC_nuc,     UP_nuc,     DO_nuc,     nuclear_units, unites, tmax)
-    # add_dmin!(model, UC_charbon, UP_charbon, DO_charbon, charbon_units, unites, tmax)
-    # add_dmin!(model, UC_ccg,     UP_ccg,     DO_ccg,     ccg_units,     unites, tmax)
-    # add_dmin!(model, UC_tac,     UP_tac,     DO_tac,     tac_units,     unites, tmax)
-    # add_dmin!(model, UC_cogen,   UP_cogen,   DO_cogen,   cogen_units,   unites, tmax)
-    # add_dmin!(model, UC_fioul,   UP_fioul,   DO_fioul,   fioul_units,   unites, tmax)
 
     # ====== CONTRAINTES ENR (MUST-TAKE) [ORIGINAL]  ======
     # == : l'ENR est obligatoirement injecté (must-take physique)
@@ -949,6 +934,14 @@ function solve_year_rolling(
     stock_hydro_raw = HYDRO_CAPACITY_MWh * stock_init_pct
     stock_hydro_current = clamp(stock_hydro_raw, stock_min_h1, stock_max_h1)
     stock_step_current  = 500_000.0  # 0.5 TWh de départ
+    # État UC inter-fenêtres pour Dmin
+    uc_prev = Dict(
+        "nuc"     => zeros(Float64, sum(1 for unit in unites if occursin("Nucléaire", unit.type))),
+        "charbon" => zeros(Float64, sum(1 for unit in unites if unit.type == "charbon")),
+        "ccg"     => zeros(Float64, sum(1 for unit in unites if unit.type == "CCG gaz")),
+        "tac"     => zeros(Float64, sum(1 for unit in unites if unit.type == "TAC gaz")),
+        "fioul"   => zeros(Float64, sum(1 for unit in unites if unit.type == "fioul")),
+    )
 
     println("  Stock hydro init (avant clamp) : $(round(stock_hydro_raw/1e6, digits=2)) TWh")
     println("  Limites janvier : [$(round(stock_min_h1/1e6, digits=2)), $(round(stock_max_h1/1e6, digits=2))] TWh")
@@ -988,7 +981,8 @@ function solve_year_rolling(
             window_num, month, scenario,
             load_w, wind_w, solar_w, fdl_w, lac_w, fat_w, dec_w, bio_w,
             stock_hydro_current, stock_step_current, hours_in_window, window_start,
-            unites, stocks_hydro
+            unites, stocks_hydro,
+            uc_prev                                                           # ← AJOUT
         )
 
         stock_hydro_before = stock_hydro_current
@@ -1058,6 +1052,21 @@ function solve_year_rolling(
             # end
         end
 
+        # Mise à jour UC pour la fenêtre suivante
+        if status == OPTIMAL
+            nuc_idx     = [u for (u, unit) in enumerate(unites) if occursin("Nucléaire", unit.type)]
+            charbon_idx = [u for (u, unit) in enumerate(unites) if unit.type == "charbon"]
+            ccg_idx     = [u for (u, unit) in enumerate(unites) if unit.type == "CCG gaz"]
+            tac_idx     = [u for (u, unit) in enumerate(unites) if unit.type == "TAC gaz"]
+            fioul_idx   = [u for (u, unit) in enumerate(unites) if unit.type == "fioul"]
+
+            uc_prev["nuc"]     = [round(value(model[:UC_nuc][hours_to_keep,     u])) for u in nuc_idx]
+            uc_prev["charbon"] = [round(value(model[:UC_charbon][hours_to_keep,  u])) for u in charbon_idx]
+            uc_prev["ccg"]     = [round(value(model[:UC_ccg][hours_to_keep,      u])) for u in ccg_idx]
+            uc_prev["tac"]     = [round(value(model[:UC_tac][hours_to_keep,      u])) for u in tac_idx]
+            uc_prev["fioul"]   = [round(value(model[:UC_fioul][hours_to_keep,    u])) for u in fioul_idx]
+        end
+
         # Stocker résultats (toujours, même si infeasible)
         for t in 1:hours_to_keep
             push!(all_results, Dict(
@@ -1098,10 +1107,13 @@ function solve_year_rolling(
                 "inflows_lac"     => inflows_lac[window_start + t - 1],
                 "inflows_fdl"     => inflows_fdl[window_start + t - 1],
                 "infeasible_flag" => (status != OPTIMAL ? 1 : 0),
-                "water_price"  => water_price_from_stock(stock_hydro_vals[t]),
-                "cost_nuc"     => sum(unites[u].prix_marche * P_nuc[t, u] for u in nuclear_units),
-                "cost_charbon" => sum(unites[u].prix_marche * P_charbon[t, u] for u in charbon_units),
-                "cost_ccg"     => sum(unites[u].prix_marche * P_ccg[t, u] for u in ccg_units),
+                "water_price"  => water_price_at_hour(window_start + t - 1),
+                "cost_nuc"     => sum(unites[u].prix_marche * value(P_nuc[t, u]) for (u, unit) in enumerate(unites) if occursin("Nucléaire", unit.type)),
+                "cost_charbon" => sum(unites[u].prix_marche * value(P_charbon[t, u]) for (u, unit) in enumerate(unites) if unit.type == "charbon"),
+                "cost_ccg"     => sum(unites[u].prix_marche * value(P_ccg[t, u]) for (u, unit) in enumerate(unites) if unit.type == "CCG gaz"),
+                "cost_tac"     => sum(unites[u].prix_marche * value(P_tac[t, u]) for (u, unit) in enumerate(unites) if unit.type == "TAC gaz"),
+                "cost_fioul"   => sum(unites[u].prix_marche * value(P_fioul[t, u]) for (u, unit) in enumerate(unites) if unit.type == "fioul"),
+            ))
         end
 
         hour = window_start + RESULTS_SIZE
@@ -1227,12 +1239,12 @@ for scenario in keys(results_all)
         inflows_lac      = [r["inflows_lac"]     for r in results_all[scenario]],
         inflows_fdl      = [r["inflows_fdl"]     for r in results_all[scenario]],
         infeasible_flag  = [r["infeasible_flag"] for r in results_all[scenario]],
-        water_price       = [r["water_price"]     for r in results_all[scenario]],
-        cost_nuc          = [r["cost_nuc"]        for r in results_all[scenario]],
-        cost_charbon      = [r["cost_charbon"]    for r in results_all[scenario]],
-        cost_ccg          = [r["cost_ccg"]        for r in results_all[scenario]],
-        cost_tac          = [r["cost_tac"]        for r in results_all[scenario]],
-        cost_fioul        = [r["cost_fioul"]      for r in results_all[scenario]]
+        water_price     = [r["water_price"]     for r in results_all[scenario]],
+        cost_nuc        = [r["cost_nuc"]        for r in results_all[scenario]],
+        cost_charbon    = [r["cost_charbon"]    for r in results_all[scenario]],
+        cost_ccg        = [r["cost_ccg"]        for r in results_all[scenario]],
+        cost_tac        = [r["cost_tac"]        for r in results_all[scenario]],
+        cost_fioul      = [r["cost_fioul"]      for r in results_all[scenario]]
     )
 
     filepath = "./results/results_$scenario.csv"
