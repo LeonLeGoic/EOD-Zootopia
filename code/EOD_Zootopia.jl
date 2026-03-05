@@ -234,11 +234,27 @@ const SEASONAL_WINDOWS = Dict(
 )
 
 # Coûts
-const COST_PUMP_STEP = 10.0  # €/MWh
+const COST_PUMP_STEP = 2.0  # €/MWh
 const COST_SPILL = 8000.0  # €/MWh
 const COST_EXCESS = 50000.0  # €/MWh
-const COST_UNSUPPLIED = 100000000.0  # €/MWh
+const COST_UNSUPPLIED = 50000000000.0
 const COST_HYDRO_OPPORTUNITY = 5.0  # €/MWh
+
+# Prix de l'eau par saison (€/MWh) - pénalise production hydro en été, l'encourage en hiver
+const WATER_PRICE_MONTHLY = Dict(
+    1 => 0.5,   # Janvier - hiver, eau abondante, bas prix
+    2 => 0.5,   # Février
+    3 => 1.0,   # Mars - printemps, transition
+    4 => 2.0,   # Avril - printemps avancé, demande irrigation monte
+    5 => 3.0,   # Mai - été approche, eau rare pour agriculture
+    6 => 4.0,   # Juin - été, eau très rare
+    7 => 4.5,   # Juillet - pic sécheresse
+    8 => 4.5,   # Août
+    9 => 3.0,   # Septembre - fin été
+    10 => 1.5,  # Octobre - automne
+    11 => 0.8,  # Novembre - hiver approche
+    12 => 0.5   # Décembre - hiver
+)
 
 # ==============================================================================
 # SECTION 5 : FONCTIONS UTILITAIRES
@@ -370,7 +386,7 @@ function create_eod_model(
     tmax::Int, window_start::Int,
     unites::Vector{UniteCentrale},
     stocks_hydro::Vector{StockHydro}
-)::Tuple{Model, Vector}
+)::Tuple{Model, Vector, Vector, Vector, Vector}
     
     model = Model(HiGHS.Optimizer)
     set_optimizer_attribute(model, "log_to_console", false)
@@ -695,19 +711,22 @@ function create_eod_model(
         for t in 1:tmax, u in fioul_units
     )
     
-    cost_hydro = sum(COST_HYDRO_OPPORTUNITY * (Phy_fdl[t] + Phy_lac[t]) for t in 1:tmax)
+    cost_hydro = sum(
+        WATER_PRICE_MONTHLY[month_from_hour(window_start + t - 1)] * (Phy_fdl[t] + Phy_lac[t])
+        for t in 1:tmax
+    )
     cost_pump = sum(COST_PUMP_STEP * Pcharge_STEP[t] for t in 1:tmax)
     cost_spill = sum(COST_SPILL * Pspill[t] for t in 1:tmax)
     cost_unserved = sum(COST_UNSUPPLIED * Puns[t] for t in 1:tmax)
     
     # Slack coûteux pour forcer la faisabilité
-    cost_slack = sum(1e6 * (slack_stock_min[t] + slack_stock_max[t] + slack_seasonal[t]) for t in 1:tmax)
+    cost_slack = sum(100_000_000 * (slack_stock_min[t] + slack_stock_max[t]) + 1e6 * slack_seasonal[t] for t in 1:tmax)
     
     @objective(model, Min,
         cost_thermal + cost_hydro + cost_pump + cost_spill + cost_unserved + cost_slack
     )
     
-    return model, stock_limits
+    return model, stock_limits, slack_stock_min, slack_stock_max, slack_seasonal
 end
 
 # ==============================================================================
@@ -780,7 +799,7 @@ function solve_year_rolling(
         hours_in_window = length(window_range)
         
         # Créer et résoudre modèle
-        model, stock_limits = create_eod_model(
+        model, stock_limits, slack_stock_min, slack_stock_max, slack_seasonal = create_eod_model(
             window_num, month, scenario,
             load_w, wind_w, solar_w, fdl_w, lac_w, fat_w, dec_w, bio_w,
             stock_hydro_current, stock_step_current, hours_in_window, window_start,
@@ -790,74 +809,79 @@ function solve_year_rolling(
         optimize!(model)
         status = termination_status(model)
         
+        # TOUJOURS récupérer les résultats (même si infeasible)
+        P_nuc = value.(model[:P_nuc])
+        P_charbon = value.(model[:P_charbon])
+        P_ccg = value.(model[:P_ccg])
+        P_tac = value.(model[:P_tac])
+        P_cogen = value.(model[:P_cogen])
+        P_fioul = value.(model[:P_fioul])
+        P_eolien = value.(model[:P_eolien])
+        P_solaire = value.(model[:P_solaire])
+        P_dechets = value.(model[:P_dechets])
+        P_biomasse = value.(model[:P_biomasse])
+        Phy_fdl = value.(model[:Phy_fdl])
+        Phy_lac = value.(model[:Phy_lac])
+        stock_hydro_vals = value.(model[:stock_hydro])
+        stock_STEP = value.(model[:stock_STEP])
+        Puns = value.(model[:Puns])
+        Pspill = value.(model[:Pspill])
+        UC_nuc = value.(model[:UC_nuc])
+        UC_charbon = value.(model[:UC_charbon])
+        UC_ccg = value.(model[:UC_ccg])
+        UC_tac = value.(model[:UC_tac])
+        UC_cogen = value.(model[:UC_cogen])
+        UC_fioul = value.(model[:UC_fioul])
+        Pcharge_STEP = value.(model[:Pcharge_STEP])
+        Pdecharge_STEP = value.(model[:Pdecharge_STEP])
+
+        # Stocker les résultats
+        for t in 1:hours_to_keep
+            push!(all_results, Dict(
+                "hour_global" => window_start + t - 1,
+                "month" => month,
+                "load" => load[window_start + t - 1],
+                "Phy_fdl" => Phy_fdl[t],
+                "Phy_lac" => Phy_lac[t],
+                "P_nuc" => sum(P_nuc[t, :]),
+                "P_charbon" => sum(P_charbon[t, :]),
+                "P_ccg" => sum(P_ccg[t, :]),
+                "P_tac" => sum(P_tac[t, :]),
+                "P_cogen" => sum(P_cogen[t, :]),
+                "P_fioul" => sum(P_fioul[t, :]),
+                "P_eolien" => sum(P_eolien[t, :]),
+                "P_solaire" => sum(P_solaire[t, :]),
+                "P_dechets" => sum(P_dechets[t, :]),
+                "P_biomasse" => sum(P_biomasse[t, :]),
+                "stock_hydro" => stock_hydro_vals[t],
+                "stock_STEP" => stock_STEP[t],
+                "Puns" => Puns[t],
+                "Pspill" => Pspill[t],
+                "UC_nuc" => sum(UC_nuc[t, :]),
+                "UC_charbon" => sum(UC_charbon[t, :]),
+                "UC_ccg" => sum(UC_ccg[t, :]),
+                "UC_tac" => sum(UC_tac[t, :]),
+                "UC_cogen" => sum(UC_cogen[t, :]),
+                "UC_fioul" => sum(UC_fioul[t, :]),
+                "Pcharge_STEP" => Pcharge_STEP[t],
+                "Pdecharge_STEP" => Pdecharge_STEP[t],
+                "stock_hydro_min" => stock_limits[t][1],
+                "stock_hydro_max" => stock_limits[t][2],
+                "slack_seasonal" => value(slack_seasonal[t]),
+                "slack_stock_min" => value(slack_stock_min[t]),
+                "slack_stock_max" => value(slack_stock_max[t]),
+                "inflows_lac" => inflows_lac[t],
+                "inflows_fdl" => inflows_fdl[t],
+                "infeasible_flag" => (status != OPTIMAL ? 1 : 0)  # Flag pour marquer fenêtre infaisable
+            ))
+        end
+
+        # Adapter le stock pour la prochaine fenêtre
         if status != OPTIMAL
             println("     ⚠️  Statut : $status")
             stock_hydro_current = max(0.0, min(HYDRO_CAPACITY_MWh * 0.5, HYDRO_CAPACITY_MWh))
             stock_step_current = 500_000.0
         else
-            # Récupérer résultats
-            P_nuc = value.(model[:P_nuc])
-            P_charbon = value.(model[:P_charbon])
-            P_ccg = value.(model[:P_ccg])
-            P_tac = value.(model[:P_tac])
-            P_cogen = value.(model[:P_cogen])
-            P_fioul = value.(model[:P_fioul])
-            P_eolien = value.(model[:P_eolien])
-            P_solaire = value.(model[:P_solaire])
-            Phy_fdl = value.(model[:Phy_fdl])
-            Phy_lac = value.(model[:Phy_lac])
-            stock_hydro_vals = value.(model[:stock_hydro])
-            stock_STEP = value.(model[:stock_STEP])
-            P_dechets = value.(model[:P_dechets])
-            P_biomasse = value.(model[:P_biomasse])
-            Puns = value.(model[:Puns])
-            # Pexc = value.(model[:Pexc])
-            Pspill = value.(model[:Pspill])
-            UC_nuc = value.(model[:UC_nuc])
-            UC_charbon = value.(model[:UC_charbon])
-            UC_ccg = value.(model[:UC_ccg])
-            UC_tac = value.(model[:UC_tac])
-            UC_cogen = value.(model[:UC_cogen])
-            UC_fioul = value.(model[:UC_fioul])
-            Pcharge_STEP = value.(model[:Pcharge_STEP])
-            Pdecharge_STEP = value.(model[:Pdecharge_STEP])
-            
-            # Stocker les résultats
-            for t in 1:hours_to_keep
-                push!(all_results, Dict(
-                    "hour_global" => window_start + t - 1,
-                    "month" => month,
-                    "load" => load[window_start + t - 1],
-                    "Phy_fdl" => Phy_fdl[t],
-                    "Phy_lac" => Phy_lac[t],
-                    "P_nuc" => sum(P_nuc[t, :]),
-                    "P_charbon" => sum(P_charbon[t, :]),
-                    "P_ccg" => sum(P_ccg[t, :]),
-                    "P_tac" => sum(P_tac[t, :]),
-                    "P_cogen" => sum(P_cogen[t, :]),
-                    "P_fioul" => sum(P_fioul[t, :]),
-                    "P_eolien" => sum(P_eolien[t, :]),
-                    "P_solaire" => sum(P_solaire[t, :]),
-                    "P_dechets" => sum(P_dechets[t, :]),
-                    "P_biomasse" => sum(P_biomasse[t, :]),
-                    "stock_hydro" => stock_hydro_vals[t],
-                    "stock_STEP" => stock_STEP[t],
-                    "Puns" => Puns[t],
-                    # "Pexc" => Pexc[t],
-                    "Pspill" => Pspill[t],
-                    "UC_nuc" => sum(UC_nuc[t, :]),
-                    "UC_charbon" => sum(UC_charbon[t, :]),
-                    "UC_ccg" => sum(UC_ccg[t, :]),
-                    "UC_tac" => sum(UC_tac[t, :]),
-                    "UC_cogen" => sum(UC_cogen[t, :]),
-                    "UC_fioul" => sum(UC_fioul[t, :]),
-                    "Pcharge_STEP" => Pcharge_STEP[t],
-                    "Pdecharge_STEP" => Pdecharge_STEP[t],
-                    "stock_hydro_min" => stock_limits[t][1],
-                    "stock_hydro_max" => stock_limits[t][2]
-                ))
-            end
-            
             stock_hydro_current = stock_hydro_vals[hours_to_keep]
             stock_step_current = stock_STEP[hours_to_keep]
             
@@ -955,7 +979,12 @@ for scenario in keys(results_all)
         Pdecharge_STEP = [r["Pdecharge_STEP"] for r in results_all[scenario]],
         Pcharge_STEP = [r["Pcharge_STEP"] for r in results_all[scenario]],
         stock_hydro_min = [r["stock_hydro_min"] for r in results_all[scenario]],
-        stock_hydro_max = [r["stock_hydro_max"] for r in results_all[scenario]]
+        stock_hydro_max = [r["stock_hydro_max"] for r in results_all[scenario]],
+        slack_seasonal = [r["slack_seasonal"] for r in results_all[scenario]],
+        slack_stock_min = [r["slack_stock_min"] for r in results_all[scenario]],
+        slack_stock_max = [r["slack_stock_max"] for r in results_all[scenario]],
+        inflows_lac = [r["inflows_lac"] for r in results_all[scenario]],
+        inflows_fdl = [r["inflows_fdl"] for r in results_all[scenario]]
     )
     
     filepath = "./results/results_$scenario.csv"
