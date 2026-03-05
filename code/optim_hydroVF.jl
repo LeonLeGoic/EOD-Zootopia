@@ -683,7 +683,7 @@ end
 ##############################################################################
 # Téléchargement des résultats dans un Excel
 ##############################################################################
-fichier_sortie = "Resultats/final_results_$(SCENARIO).xlsx"
+fichier_sortie = "./results/final_results_$(SCENARIO).xlsx"
 println("\nÉcriture de $fichier_sortie …")
 
 XLSX.openxlsx(fichier_sortie, mode="w") do xf
